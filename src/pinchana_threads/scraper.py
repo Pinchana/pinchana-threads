@@ -9,6 +9,7 @@ Strategy:
 """
 
 import asyncio
+import html
 import json
 import logging
 from typing import Optional
@@ -225,11 +226,16 @@ class ThreadsCloakScraper:
         link_preview = text_post_app_info.get("link_preview_attachment") or {}
         link_url = link_preview.get("url")
 
+        caption_text = caption.get("text") if caption else None
+        caption_html, text_spoiler = ThreadsCloakScraper._build_caption_html(text_post_app_info, caption_text)
+
         return {
             "post_id": raw.get("pk"),
             "code": raw.get("code"),
             "url": f"https://www.threads.com/t/{raw.get('code')}" if raw.get("code") else None,
-            "text": caption.get("text") if caption else None,
+            "text": caption_text,
+            "text_html": caption_html,
+            "text_spoiler": text_spoiler,
             "taken_at": raw.get("taken_at"),
             "like_count": raw.get("like_count"),
             "reply_count": text_post_app_info.get("reply_count") or text_post_app_info.get("direct_reply_count"),
@@ -240,6 +246,36 @@ class ThreadsCloakScraper:
             "spoiler": bool(text_post_app_info.get("is_spoiler_media")),
             "media": ThreadsCloakScraper._parse_media_items(raw),
         }
+
+    @staticmethod
+    def _build_caption_html(text_post_app_info: dict, fallback_text: str | None) -> tuple[str | None, bool]:
+        """Build Telegram-safe caption HTML with spoiler fragments preserved."""
+        fragments = (text_post_app_info.get("text_fragments") or {}).get("fragments") or []
+        if not fragments:
+            return (html.escape(fallback_text) if fallback_text else None, False)
+
+        parts: list[str] = []
+        has_spoiler = False
+
+        for fragment in fragments:
+            if not isinstance(fragment, dict):
+                continue
+
+            text = fragment.get("plaintext")
+            if text is None:
+                # Fallback for non-plaintext fragments
+                text = fragment.get("linkified_web_url") or ""
+
+            escaped = html.escape(str(text))
+            style = fragment.get("styling_info") or {}
+            if style.get("is_spoiler"):
+                has_spoiler = True
+                parts.append(f"<tg-spoiler>{escaped}</tg-spoiler>")
+            else:
+                parts.append(escaped)
+
+        caption_html = "".join(parts).strip() or (html.escape(fallback_text) if fallback_text else None)
+        return caption_html, has_spoiler
 
     @staticmethod
     def _parse_media_items(raw: dict) -> list[dict]:

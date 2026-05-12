@@ -23,6 +23,8 @@ class ThreadsScrapeResponse(ScrapeResponse):
     repost_count: Optional[int] = None
     quote_count: Optional[int] = None
     spoiler: bool = False
+    text_spoiler: bool = False
+    text_html: Optional[str] = None
 
 
 logging.basicConfig(level=logging.INFO)
@@ -149,6 +151,8 @@ async def _scrape_post(code: str) -> ThreadsScrapeResponse:
         repost_count=parsed.get("repost_count"),
         quote_count=parsed.get("quote_count"),
         spoiler=bool(parsed.get("spoiler")),
+        text_spoiler=bool(parsed.get("text_spoiler")),
+        text_html=parsed.get("text_html"),
     )
     storage.save_metadata(code, response.model_dump())
     return response
