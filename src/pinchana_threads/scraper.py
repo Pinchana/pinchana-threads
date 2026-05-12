@@ -284,22 +284,38 @@ class ThreadsCloakScraper:
         carousel = raw.get("carousel_media") or []
         if carousel:
             for node in carousel:
-                items.append(ThreadsCloakScraper._media_node(node))
+                parsed = ThreadsCloakScraper._media_node(node)
+                if parsed.get("url"):
+                    items.append(parsed)
         else:
-            items.append(ThreadsCloakScraper._media_node(raw))
+            parsed = ThreadsCloakScraper._media_node(raw)
+            if parsed.get("url"):
+                items.append(parsed)
         return items
 
     @staticmethod
     def _media_node(node: dict) -> dict:
         """Single media item parser."""
         is_video = node.get("is_video", False)
+
+        video_url = node.get("video_url")
+        if not video_url:
+            video_versions = node.get("video_versions") or []
+            if isinstance(video_versions, list) and video_versions:
+                first = video_versions[0] or {}
+                video_url = first.get("url") if isinstance(first, dict) else None
+
+        image_url = None
+        image_versions = node.get("image_versions2") or {}
+        candidates = image_versions.get("candidates") or []
+        if isinstance(candidates, list) and candidates:
+            first = candidates[0] or {}
+            if isinstance(first, dict):
+                image_url = first.get("url")
+
         return {
             "type": "video" if is_video else "image",
-            "url": (
-                node.get("video_url")
-                if is_video
-                else node.get("image_versions2", {}).get("candidates", [{}])[0].get("url")
-            ),
+            "url": video_url if is_video else image_url,
             "width": node.get("original_width"),
             "height": node.get("original_height"),
         }
