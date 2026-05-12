@@ -30,6 +30,7 @@ RUN uv sync --frozen && \
 RUN mkdir -p /app/cache
 ENV CACHE_PATH=/app/cache
 ENV CACHE_MAX_SIZE_GB=10.0
+ENV CLOAKBROWSER_AUTO_UPDATE=false
 
 EXPOSE 8088
 CMD ["uv", "run", "uvicorn", "pinchana_threads.main:app", "--host", "0.0.0.0", "--port", "8088"]

@@ -6,7 +6,7 @@ import os
 import re
 from typing import Optional
 from fastapi import APIRouter, HTTPException, FastAPI
-from pydantic import BaseModel
+from fastapi.responses import FileResponse
 from pinchana_core.models import ScrapeRequest, ScrapeResponse, MediaItem
 from pinchana_core.storage import MediaStorage
 from pinchana_core.vpn import GluetunController, VpnRotationError
@@ -197,6 +197,25 @@ async def process_scrape_request(request: ScrapeRequest):
         status_code=503 if isinstance(last_error, RateLimitError) else 500,
         detail=str(last_error),
     )
+
+
+@router.get("/media/{platform}/{post_id}/{filename:path}")
+async def serve_media(platform: str, post_id: str, filename: str):
+    if platform != "threads":
+        raise HTTPException(status_code=404, detail="Invalid platform")
+    if ".." in filename or filename.startswith("/"):
+        raise HTTPException(status_code=404, detail="Invalid path")
+
+    file_path = storage.base_path / post_id / filename
+    resolved = file_path.resolve()
+    base_resolved = storage.base_path.resolve()
+    if not str(resolved).startswith(str(base_resolved)):
+        raise HTTPException(status_code=404, detail="Invalid path")
+
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(resolved)
 
 
 @router.get("/health")
