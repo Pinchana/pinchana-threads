@@ -11,7 +11,7 @@ from pinchana_core.models import ScrapeRequest, ScrapeResponse, MediaItem
 from pinchana_core.storage import MediaStorage
 from pinchana_core.vpn import GluetunController, VpnRotationError
 from pinchana_core.plugins import ScraperPlugin, registry
-from .scraper import ThreadsGraphScraper, RateLimitError, NotFoundError
+from .scraper import ThreadsCloakScraper, RateLimitError, NotFoundError
 
 
 class ThreadsScrapeResponse(ScrapeResponse):
@@ -23,11 +23,12 @@ class ThreadsScrapeResponse(ScrapeResponse):
     repost_count: Optional[int] = None
     quote_count: Optional[int] = None
 
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-scraper = ThreadsGraphScraper()
+scraper = ThreadsCloakScraper()
 gluetun = GluetunController()
 storage = MediaStorage(
     base_path=os.getenv("CACHE_PATH", "./cache"),
@@ -92,18 +93,6 @@ def extract_post_id(url: str) -> str:
     return match.group(1)
 
 
-def _thread_id_to_numeric(code: str) -> str:
-    """
-    Convert a base-36 Threads shortcode to the numeric post ID.
-
-    Threads post IDs are base-36 encoded in URLs.
-    """
-    try:
-        return str(int(code, 36))
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid Threads post code.")
-
-
 async def _download_media(post_id: str, media_list: list[dict]) -> list[MediaItem]:
     """Download all media for a post and return MediaItem descriptors."""
     storage.prepare_post_dir(post_id)
@@ -140,10 +129,7 @@ async def _download_media(post_id: str, media_list: list[dict]) -> list[MediaIte
 
 async def _scrape_post(code: str) -> ThreadsScrapeResponse:
     """Scrape a single Threads post by its URL shortcode."""
-    post_id = _thread_id_to_numeric(code)
-
-    raw = await scraper.get_post(post_id)
-    parsed = scraper.parse_thread_item(raw)
+    parsed = await scraper.scrape_post(code)
 
     media_items = await _download_media(code, parsed.get("media") or [])
 
@@ -189,6 +175,10 @@ async def process_scrape_request(request: ScrapeRequest):
             last_error = e
             logger.warning(f"Attempt {attempt} rate-limited: {e}")
             if attempt < 3:
+                try:
+                    await gluetun.rotate_ip()
+                except VpnRotationError as ve:
+                    logger.warning(f"VPN rotation failed: {ve}")
                 await asyncio.sleep(15)
         except VpnRotationError as e:
             last_error = e
@@ -231,7 +221,5 @@ registry.register(
 )
 
 # Standalone FastAPI app for container mode
-from fastapi import FastAPI
-
 app = FastAPI(title="Pinchana Threads", version="0.1.0")
 app.include_router(router)

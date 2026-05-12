@@ -4,6 +4,14 @@ WORKDIR /workspace/pinchana-threads
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
+# Install system dependencies required by CloakBrowser / Playwright
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libnss3 libatk-bridge2.0-0 libxss1 libgtk-3-0 \
+    libasound2 libxtst6 libgbm1 libxshmfence1 \
+    libxcomposite1 libxdamage1 libxrandr2 libpangocairo-1.0-0 \
+    fonts-liberation libcurl4 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy pinchana-core (local path dependency) first
 COPY pinchana-core/pyproject.toml pinchana-core/uv.lock pinchana-core/README.md ../pinchana-core/
 RUN mkdir -p ../pinchana-core/src
@@ -14,6 +22,10 @@ COPY pinchana-threads/pyproject.toml pinchana-threads/uv.lock pinchana-threads/R
 RUN uv sync --frozen --no-install-project
 
 COPY pinchana-threads/src ./src
+
+# Install the local project + pre-download CloakBrowser stealth binary
+RUN uv sync --frozen && \
+    uv run python -c "from cloakbrowser.browser import ensure_binary; ensure_binary()" || true
 
 RUN mkdir -p /app/cache
 ENV CACHE_PATH=/app/cache

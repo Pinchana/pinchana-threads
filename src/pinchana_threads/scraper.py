@@ -1,16 +1,19 @@
 """
-Threads GraphQL scraper — lightweight, no-browser extraction.
+Threads scraper using CloakBrowser (stealth Chromium) + CDP interception.
 
-Uses curl_cffi with JA3 impersonation to hit Threads' internal
-Barcelona GraphQL endpoints after bootstrapping session cookies.
+Strategy:
+1. Launch CloakBrowser (patched Chromium) and navigate to the post URL.
+2. Intercept api/graphql responses via CDP to extract structured post data.
+3. Fallback: extract hidden JSON from <script type="application/json" data-sjs> tags.
+4. Media downloads still use curl_cffi via the VPN tunnel.
 """
 
+import asyncio
 import json
 import logging
-import urllib.parse
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from typing import Optional
 from curl_cffi.requests import AsyncSession
-from pinchana_core.vpn import GluetunController, VpnRotationError
+from cloakbrowser import launch_async
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +24,7 @@ class ScraperError(Exception):
 
 
 class RateLimitError(ScraperError):
-    """Exception indicating network-level blocking (429/403)."""
+    """Exception indicating network-level blocking (429/403/timeout)."""
     pass
 
 
@@ -30,180 +33,186 @@ class NotFoundError(ScraperError):
     pass
 
 
-gluetun = GluetunController()
-
-
-async def trigger_rotation(retry_state):
-    """Trigger VPN IP rotation before each retry."""
-    logger.warning(f"Retry attempt {retry_state.attempt_number}. Rotating VPN IP...")
-    try:
-        await gluetun.rotate_ip()
-    except VpnRotationError as e:
-        logger.warning(f"VPN rotation failed: {e}")
-        raise RateLimitError(str(e))
-
-
-class ThreadsGraphScraper:
+class ThreadsCloakScraper:
     """
-    Scrapes Threads.net via its internal GraphQL API.
+    Scrapes Threads.net via CloakBrowser (stealth Chromium).
 
-    The web app uses Relay with `doc_id` parameters.  Public data
-    (profiles, posts, replies) can be fetched without authentication
-    by setting the correct `x-ig-app-id` header and bootstrapping a
-    session from the homepage to obtain a CSRF token.
+    Uses a real browser to render the SPA, intercepts GraphQL responses,
+    and falls back to hidden DOM JSON if interception fails.
     """
 
     BASE_URL = "https://www.threads.com"
-    GRAPHQL_ENDPOINT = f"{BASE_URL}/api/graphql"
-
-    # IG App ID required by Threads web backend.
-    IG_APP_ID = "238260118697367"
-
-    # Known doc_ids (volatile — Meta rotates these).
-    DOC_IDS = {
-        "user_profile": "23996318473300828",
-        "user_threads": "6232751443445612",
-        "user_replies": "6307072669391286",
-        "post_detail": "5587632691339264",
-        "post_media": "9360915773983802",
-    }
 
     def __init__(self):
-        self.base_headers = {
-            "x-ig-app-id": self.IG_APP_ID,
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Origin": self.BASE_URL,
-            "Referer": f"{self.BASE_URL}/",
-            "x-requested-with": "XMLHttpRequest",
-        }
+        self._impersonate = "chrome124"
 
-    def _is_network_timeout(self, e: Exception) -> bool:
-        error_msg = str(e).lower()
-        return any(x in error_msg for x in ("timeout", "timed out", "connection", "curl: (28)"))
-
-    async def _bootstrap_session(self, session: AsyncSession):
+    async def scrape_post(self, shortcode: str) -> dict:
         """
-        Harvest CSRF token and session cookies from Threads homepage.
+        Scrape a Threads post by its URL shortcode.
 
-        This is the critical anti-detection step: we warm up the TCP/TLS
-        connection and collect the cookies the backend expects on GraphQL
-        requests, all without launching a browser.
+        Returns a flattened dict compatible with parse_thread_item().
         """
+        url = f"{self.BASE_URL}/t/{shortcode}"
+        browser = None
+
         try:
-            response = await session.get(self.BASE_URL, timeout=15)
+            logger.info("Launching CloakBrowser for %s", shortcode)
+            browser = await launch_async(
+                headless=True,
+                humanize=True,
+                args=[
+                    "--disable-gpu",
+                    "--window-size=1280,720",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
         except Exception as e:
-            if self._is_network_timeout(e):
-                raise RateLimitError(f"Network timeout during bootstrap: {e}")
+            logger.error("CloakBrowser launch failed: %s", e)
+            raise RateLimitError(f"Browser launch failed: {e}") from e
+
+        try:
+            page = await browser.new_page()
+            graphql_responses: list[dict] = []
+            response_tasks: list[asyncio.Task] = []
+
+            async def _capture(response):
+                try:
+                    if "api/graphql" in response.url:
+                        body = await response.json()
+                        graphql_responses.append(body)
+                except Exception:
+                    pass
+
+            def _on_response(response):
+                task = asyncio.create_task(_capture(response))
+                response_tasks.append(task)
+
+            page.on("response", _on_response)
+
+            logger.info("Navigating to %s", url)
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+
+            # Allow pending response handlers to finish + JS hydration
+            await asyncio.sleep(2.0)
+            if response_tasks:
+                await asyncio.gather(*response_tasks, return_exceptions=True)
+
+            # 1. Try intercepted GraphQL responses
+            thread_data: Optional[dict] = None
+            for resp in graphql_responses:
+                candidate = self._extract_post_from_graphql(resp, shortcode)
+                if candidate:
+                    thread_data = candidate
+                    logger.info("Extracted post %s from GraphQL interception", shortcode)
+                    break
+
+            # 2. Fallback: hidden JSON in DOM
+            if not thread_data:
+                logger.info("GraphQL interception empty; trying DOM fallback for %s", shortcode)
+                thread_data = await self._extract_from_dom(page, shortcode)
+
+            if not thread_data:
+                raise NotFoundError(f"Post {shortcode} not found or is private")
+
+            return thread_data
+
+        except NotFoundError:
             raise
-        response.raise_for_status()
-
-        csrf_token = session.cookies.get("csrftoken")
-        if csrf_token:
-            self.base_headers["x-csrftoken"] = csrf_token
-        else:
-            logger.warning("Failed to extract CSRF token during bootstrap.")
-
-    def _build_payload(self, doc_id: str, variables: dict) -> str:
-        """Encode GraphQL variables and doc_id for application/x-www-form-urlencoded."""
-        payload = {
-            "doc_id": doc_id,
-            "variables": json.dumps(variables),
-        }
-        return urllib.parse.urlencode(payload)
-
-    @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1.5, min=4, max=30),
-        retry=retry_if_exception_type(RateLimitError),
-        before_sleep=trigger_rotation,
-    )
-    async def _graphql_request(self, doc_id: str, variables: dict) -> dict:
-        """Execute a single GraphQL request with impersonation and retry logic."""
-        async with AsyncSession(impersonate="chrome124") as session:
-            await self._bootstrap_session(session)
-
-            headers = self.base_headers.copy()
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
-
-            data = self._build_payload(doc_id, variables)
-
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(x in error_msg for x in ("timeout", "timed out", "net::")):
+                raise RateLimitError(f"Page load error: {e}") from e
+            raise ScraperError(f"Extraction failed: {e}") from e
+        finally:
             try:
-                response = await session.post(
-                    self.GRAPHQL_ENDPOINT,
-                    headers=headers,
-                    data=data,
-                    timeout=15,
-                )
+                await browser.close()
             except Exception as e:
-                if self._is_network_timeout(e):
-                    raise RateLimitError(f"Network timeout, will retry: {e}")
-                raise
-
-            if response.status_code in {401, 403, 429}:
-                raise RateLimitError(f"HTTP {response.status_code}: IP restriction detected.")
-
-            response.raise_for_status()
-            return response.json()
+                logger.warning("Browser close error: %s", e)
 
     # ------------------------------------------------------------------
-    # Public extraction helpers
+    # Extraction helpers
     # ------------------------------------------------------------------
 
-    async def get_user_profile(self, user_id: str) -> dict:
-        """Fetch profile metadata for a numeric user ID."""
-        data = await self._graphql_request(
-            self.DOC_IDS["user_profile"],
-            {"userID": user_id},
-        )
-        user = data.get("data", {}).get("userData", {}).get("user")
-        if user is None:
-            raise NotFoundError(f"User {user_id} not found or is private.")
-        return user
+    def _extract_post_from_graphql(self, resp: dict, shortcode: str) -> Optional[dict]:
+        """Try to extract the post node from a captured GraphQL response."""
+        try:
+            data = resp.get("data", {})
 
-    async def get_user_threads(self, user_id: str, after: str | None = None) -> dict:
-        """Fetch a page of threads (posts) for a user."""
-        variables: dict = {"userID": user_id}
-        if after:
-            variables["after"] = after
-        return await self._graphql_request(self.DOC_IDS["user_threads"], variables)
+            # Shape A: mediaData.threads (post detail)
+            candidate = (
+                data.get("mediaData", {}).get("threads")
+                or data.get("mediaData")
+            )
+            if candidate:
+                if isinstance(candidate, list):
+                    candidate = candidate[0]
+                if isinstance(candidate, dict) and "thread_items" in candidate:
+                    candidate = candidate["thread_items"][0].get("post", {})
+                code = candidate.get("code") or candidate.get("shortcode")
+                if code == shortcode:
+                    return self._parse_thread_item(candidate)
 
-    async def get_user_replies(self, user_id: str, after: str | None = None) -> dict:
-        """Fetch a page of replies for a user."""
-        variables: dict = {"userID": user_id}
-        if after:
-            variables["after"] = after
-        return await self._graphql_request(self.DOC_IDS["user_replies"], variables)
+            # Shape B: thread_items array
+            items = data.get("thread_items") or []
+            for item in items:
+                post = item.get("post") if isinstance(item, dict) else None
+                if post and (post.get("code") == shortcode or post.get("shortcode") == shortcode):
+                    return self._parse_thread_item(post)
 
-    async def get_post(self, post_id: str) -> dict:
-        """Fetch full post detail by numeric post ID."""
-        data = await self._graphql_request(
-            self.DOC_IDS["post_detail"],
-            {"postID": post_id},
-        )
-        post = data.get("data", {}).get("mediaData", {}).get("threads")
-        if post is None:
-            raise NotFoundError(f"Post {post_id} not found or is private.")
-        return post
+            # Shape C: data contains the post directly
+            code = data.get("code") or data.get("shortcode")
+            if code == shortcode:
+                return self._parse_thread_item(data)
+
+        except Exception:
+            pass
+        return None
+
+    async def _extract_from_dom(self, page, shortcode: str) -> Optional[dict]:
+        """Extract post data from hidden <script data-sjs> JSON tags."""
+        try:
+            scripts_data = await page.evaluate("""() => {
+                const nodes = document.querySelectorAll('script[type="application/json"][data-sjs]');
+                const out = [];
+                nodes.forEach(n => {
+                    try { out.push(JSON.parse(n.innerText)); } catch(e) {}
+                });
+                return out;
+            }""")
+        except Exception as e:
+            logger.warning("DOM script extraction failed: %s", e)
+            return None
+
+        for data in scripts_data:
+            candidate = self._find_post_in_json(data, shortcode)
+            if candidate:
+                logger.info("Extracted post %s from DOM JSON", shortcode)
+                return self._parse_thread_item(candidate)
+        return None
+
+    def _find_post_in_json(self, obj, shortcode: str) -> Optional[dict]:
+        """Recursively search a JSON object for a post node matching the shortcode."""
+        if isinstance(obj, dict):
+            code = obj.get("code") or obj.get("shortcode")
+            if code == shortcode:
+                # Verify it looks like a post node (has pk or id)
+                if "pk" in obj or "id" in obj or "user" in obj:
+                    return obj
+            for v in obj.values():
+                found = self._find_post_in_json(v, shortcode)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = self._find_post_in_json(item, shortcode)
+                if found:
+                    return found
+        return None
 
     # ------------------------------------------------------------------
     # Parsers
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def parse_user_profile(raw: dict) -> dict:
-        """Flatten a raw user profile GraphQL node."""
-        return {
-            "user_id": raw.get("pk"),
-            "username": raw.get("username"),
-            "full_name": raw.get("full_name"),
-            "biography": raw.get("biography"),
-            "profile_pic_url": raw.get("profile_pic_url"),
-            "follower_count": raw.get("follower_count"),
-            "following_count": raw.get("following_count"),
-            "is_verified": raw.get("is_verified"),
-            "is_private": raw.get("is_private"),
-        }
 
     @staticmethod
     def parse_thread_item(raw: dict) -> dict:
@@ -227,9 +236,8 @@ class ThreadsGraphScraper:
             "repost_count": text_post_app_info.get("repost_count"),
             "quote_count": text_post_app_info.get("quote_count"),
             "username": user.get("username"),
-            "user_pic": user.get("profile_pic_url"),
             "link": link_url,
-            "media": ThreadsGraphScraper._parse_media_items(raw),
+            "media": ThreadsCloakScraper._parse_media_items(raw),
         }
 
     @staticmethod
@@ -239,9 +247,9 @@ class ThreadsGraphScraper:
         carousel = raw.get("carousel_media") or []
         if carousel:
             for node in carousel:
-                items.append(ThreadsGraphScraper._media_node(node))
+                items.append(ThreadsCloakScraper._media_node(node))
         else:
-            items.append(ThreadsGraphScraper._media_node(raw))
+            items.append(ThreadsCloakScraper._media_node(raw))
         return items
 
     @staticmethod
@@ -250,7 +258,23 @@ class ThreadsGraphScraper:
         is_video = node.get("is_video", False)
         return {
             "type": "video" if is_video else "image",
-            "url": node.get("video_url") if is_video else node.get("image_versions2", {}).get("candidates", [{}])[0].get("url"),
+            "url": (
+                node.get("video_url")
+                if is_video
+                else node.get("image_versions2", {}).get("candidates", [{}])[0].get("url")
+            ),
             "width": node.get("original_width"),
             "height": node.get("original_height"),
         }
+
+    # ------------------------------------------------------------------
+    # Direct media download (kept for compatibility)
+    # ------------------------------------------------------------------
+
+    async def download_media(self, url: str, dest: str) -> None:
+        """Download a single media file via curl_cffi through the VPN."""
+        async with AsyncSession(impersonate=self._impersonate) as session:
+            resp = await session.get(url, timeout=30)
+            resp.raise_for_status()
+            with open(dest, "wb") as f:
+                f.write(resp.content)
