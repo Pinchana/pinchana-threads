@@ -53,7 +53,7 @@ class ThreadsGraphScraper:
     session from the homepage to obtain a CSRF token.
     """
 
-    BASE_URL = "https://www.threads.net"
+    BASE_URL = "https://www.threads.com"
     GRAPHQL_ENDPOINT = f"{BASE_URL}/api/graphql"
 
     # IG App ID required by Threads web backend.
@@ -219,7 +219,7 @@ class ThreadsGraphScraper:
         return {
             "post_id": raw.get("pk"),
             "code": raw.get("code"),
-            "url": f"https://www.threads.net/t/{raw.get('code')}" if raw.get("code") else None,
+            "url": f"https://www.threads.com/t/{raw.get('code')}" if raw.get("code") else None,
             "text": caption.get("text") if caption else None,
             "taken_at": raw.get("taken_at"),
             "like_count": raw.get("like_count"),

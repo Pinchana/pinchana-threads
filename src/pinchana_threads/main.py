@@ -83,7 +83,7 @@ def extract_post_id(url: str) -> str:
     """Extract the Threads post shortcode from a URL.
 
     Supports both /t/ and /post/ paths:
-      https://www.threads.net/t/ABC123
+      https://www.threads.com/t/ABC123
       https://www.threads.com/@user/post/ABC123
     """
     match = re.search(r"/(?:t|post)/([^/?#&]+)", str(url))
@@ -226,7 +226,7 @@ registry.register(
     ScraperPlugin(
         name="threads",
         router=router,
-        route_patterns=["threads.net"],
+        route_patterns=["threads.com"],
     )
 )
 
