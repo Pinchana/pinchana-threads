@@ -151,19 +151,19 @@ class ThreadsCloakScraper:
                     candidate = candidate["thread_items"][0].get("post", {})
                 code = candidate.get("code") or candidate.get("shortcode")
                 if code == shortcode:
-                    return self._parse_thread_item(candidate)
+                    return self.parse_thread_item(candidate)
 
             # Shape B: thread_items array
             items = data.get("thread_items") or []
             for item in items:
                 post = item.get("post") if isinstance(item, dict) else None
                 if post and (post.get("code") == shortcode or post.get("shortcode") == shortcode):
-                    return self._parse_thread_item(post)
+                    return self.parse_thread_item(post)
 
             # Shape C: data contains the post directly
             code = data.get("code") or data.get("shortcode")
             if code == shortcode:
-                return self._parse_thread_item(data)
+                return self.parse_thread_item(data)
 
         except Exception:
             pass
@@ -188,7 +188,7 @@ class ThreadsCloakScraper:
             candidate = self._find_post_in_json(data, shortcode)
             if candidate:
                 logger.info("Extracted post %s from DOM JSON", shortcode)
-                return self._parse_thread_item(candidate)
+                return self.parse_thread_item(candidate)
         return None
 
     def _find_post_in_json(self, obj, shortcode: str) -> Optional[dict]:
@@ -232,11 +232,12 @@ class ThreadsCloakScraper:
             "text": caption.get("text") if caption else None,
             "taken_at": raw.get("taken_at"),
             "like_count": raw.get("like_count"),
-            "reply_count": text_post_app_info.get("reply_count"),
+            "reply_count": text_post_app_info.get("reply_count") or text_post_app_info.get("direct_reply_count"),
             "repost_count": text_post_app_info.get("repost_count"),
             "quote_count": text_post_app_info.get("quote_count"),
             "username": user.get("username"),
             "link": link_url,
+            "spoiler": bool(text_post_app_info.get("is_spoiler_media")),
             "media": ThreadsCloakScraper._parse_media_items(raw),
         }
 
