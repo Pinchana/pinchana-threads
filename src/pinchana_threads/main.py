@@ -80,8 +80,13 @@ def _cached_media_ready(metadata: dict) -> bool:
 
 
 def extract_post_id(url: str) -> str:
-    """Extract the Threads post shortcode from a URL."""
-    match = re.search(r"/t/([^/?#&]+)", str(url))
+    """Extract the Threads post shortcode from a URL.
+
+    Supports both /t/ and /post/ paths:
+      https://www.threads.net/t/ABC123
+      https://www.threads.com/@user/post/ABC123
+    """
+    match = re.search(r"/(?:t|post)/([^/?#&]+)", str(url))
     if not match:
         raise HTTPException(status_code=400, detail="Invalid Threads URL format.")
     return match.group(1)
