@@ -92,7 +92,16 @@ class ThreadsCloakScraper:
             page.on("response", _on_response)
 
             logger.info("Navigating to %s", url)
-            await page.goto(url, wait_until="networkidle", timeout=30000)
+            nav_response = await page.goto(url, wait_until="networkidle", timeout=30000)
+
+            # Playwright does not raise on HTTP 403/429 — it loads the blocked
+            # page normally. A clean IP-block therefore looked like "post not
+            # found" and never triggered VPN rotation. Check the nav status
+            # explicitly so the endpoint retry loop + rotation fires.
+            if nav_response is not None:
+                status = nav_response.status
+                if status in (401, 403, 429) or status >= 500:
+                    raise RateLimitError(f"Threads returned HTTP {status} (IP block detected)")
 
             # Allow pending response handlers to finish + JS hydration
             await asyncio.sleep(2.0)
