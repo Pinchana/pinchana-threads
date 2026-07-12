@@ -1,13 +1,13 @@
 # 🧵 Pinchana Threads Scraper
 
-**Pinchana Threads Scraper** is a high-performance module for extracting posts, profiles, and engagement data from Meta's Threads platform using a lightweight GraphQL-only strategy — no browser required.
+**Pinchana Threads Scraper** extracts public post data and media from Meta's Threads platform with a fast HTTP-first strategy and a pooled stealth-browser fallback for gated responses.
 
 ---
 
 ## ✨ Key Features
 
-- **🚀 GraphQL-Only Scraping:** Direct queries to Threads' internal Barcelona GraphQL API using `curl-cffi` with JA3/TLS fingerprint impersonation.
-- **🔐 Cookie + Session Reuse:** Harvests session cookies from an initial homepage bootstrap, then reuses them for sustained scraping without full browser automation.
+- **🚀 Browserless Fast Path:** Fetches the server-rendered post page with a shared `curl-cffi` connection pool and extracts its `data-sjs` JSON payload.
+- **🛡 Gating Fallback:** Reuses one lazily started CloakBrowser process when Threads returns a login, challenge, or incomplete payload.
 - **🔄 Smart VPN Rotation:** Automatically detects rate limits (403/429) and signals the VPN (Gluetun) to rotate IPs.
 - **💾 Local Caching:** Saves downloaded media and metadata to a persistent LRU cache.
 - **🌐 Standalone Service:** Operates as a FastAPI service that can be easily integrated into the Pinchana Gateway.
@@ -16,11 +16,11 @@
 
 ## 🏗 Architecture
 
-The scraper follows an "Bootstrap → Extract → Download → Cache" workflow:
-1. **Bootstrap:** Hits `threads.net` homepage to harvest `csrftoken` and session cookies.
-2. **Extraction:** Uses Threads GraphQL `doc_id`-based queries with robust retry and anti-block handling.
-3. **Download:** Media is downloaded through the secure VPN tunnel.
-4. **Storage:** Files are organized under `/app/cache/threads/{post_id}`.
+The scraper follows an "HTTP → Fallback → Download → Cache" workflow:
+1. **HTTP extraction:** Fetches the canonical post page and searches server-rendered JSON for the requested shortcode.
+2. **Browser fallback:** For gated or incomplete pages, opens an isolated page in a shared CloakBrowser process and inspects GraphQL/DOM JSON.
+3. **Download:** Downloads media through the secure VPN tunnel.
+4. **Storage:** Stores files and metadata under the configured cache path.
 
 ---
 
@@ -46,6 +46,8 @@ Checks service health, VPN connectivity, and scraper status.
 | `CACHE_PATH` | `./cache` | Base path for media storage. |
 | `CACHE_MAX_SIZE_GB` | `10.0` | Max size for the LRU cache. |
 | `GLUETUN_CONTROL_URL` | `http://localhost:8000` | URL for the Gluetun control API. |
+| `THREADS_HTTP_CONCURRENCY` | `20` | Maximum concurrent requests in the shared HTTP session. |
+| `THREADS_BROWSER_CONCURRENCY` | `2` | Maximum simultaneous pages in the fallback browser. |
 
 ---
 
@@ -55,7 +57,7 @@ Managed by `uv`.
 
 ```bash
 uv sync
-uv run uvicorn src.pinchana_threads.main:app --host 0.0.0.0 --port 8083
+uv run uvicorn pinchana_threads.main:app --host 0.0.0.0 --port 8088
 ```
 
 ---
@@ -116,7 +118,7 @@ To consume from the bot, replace the external API call with:
 ```python
 async with aiohttp.ClientSession() as session:
     async with session.post(
-        "http://localhost:8083/scrape",
+        "http://localhost:8088/scrape",
         json={"url": "https://www.threads.net/t/..."}
     ) as resp:
         data = await resp.json()

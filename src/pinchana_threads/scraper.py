@@ -1,18 +1,15 @@
-"""
-Threads scraper using CloakBrowser (stealth Chromium) + CDP interception.
-
-Strategy:
-1. Launch CloakBrowser (patched Chromium) and navigate to the post URL.
-2. Intercept api/graphql responses via CDP to extract structured post data.
-3. Fallback: extract hidden JSON from <script type="application/json" data-sjs> tags.
-4. Media downloads still use curl_cffi via the VPN tunnel.
-"""
+"""HTTP-first Threads scraper with a pooled stealth-browser fallback."""
 
 import asyncio
 import html
 import json
 import logging
+import os
+import time
+from collections import Counter
+from html.parser import HTMLParser
 from typing import Optional
+
 from curl_cffi.requests import AsyncSession
 from cloakbrowser import launch_async
 
@@ -34,6 +31,134 @@ class NotFoundError(ScraperError):
     pass
 
 
+class HttpExtractionUnavailable(ScraperError):
+    """The page could not be extracted safely without rendering JavaScript."""
+
+    def __init__(self, reason: str, status_code: int | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.status_code = status_code
+
+
+class _DataSjsParser(HTMLParser):
+    """Collect JSON bodies from Threads' server-rendered data-sjs scripts."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._capturing = False
+        self._parts: list[str] = []
+        self.payloads: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if (
+            tag.lower() == "script"
+            and attributes.get("type") == "application/json"
+            and "data-sjs" in attributes
+        ):
+            self._capturing = True
+            self._parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._capturing:
+            self._parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script" and self._capturing:
+            self.payloads.append("".join(self._parts))
+            self._capturing = False
+            self._parts = []
+
+
+class ThreadsPostParser:
+    """Parse post nodes shared by the HTTP and browser extractors."""
+
+    @classmethod
+    def find_post_in_json(cls, obj, shortcode: str) -> Optional[dict]:
+        if isinstance(obj, dict):
+            code = obj.get("code") or obj.get("shortcode")
+            if code == shortcode and ("pk" in obj or "id" in obj or "user" in obj):
+                return obj
+            for value in obj.values():
+                found = cls.find_post_in_json(value, shortcode)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = cls.find_post_in_json(item, shortcode)
+                if found:
+                    return found
+        return None
+
+    @classmethod
+    def parse_html(cls, document: str, shortcode: str) -> Optional[dict]:
+        parser = _DataSjsParser()
+        parser.feed(document)
+        parser.close()
+
+        for payload in parser.payloads:
+            try:
+                data = json.loads(payload)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            candidate = cls.find_post_in_json(data, shortcode)
+            if candidate:
+                return ThreadsCloakScraper.parse_thread_item(candidate)
+        return None
+
+
+class ThreadsHttpExtractor:
+    """Fetch the server-rendered post payload without launching a browser."""
+
+    BASE_URL = "https://www.threads.com"
+
+    def __init__(self, impersonate: str = "chrome"):
+        self._session = AsyncSession(
+            impersonate=impersonate,
+            max_clients=int(os.getenv("THREADS_HTTP_CONCURRENCY", "20")),
+        )
+        self._headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+        }
+
+    async def scrape_post(self, shortcode: str) -> dict:
+        url = f"{self.BASE_URL}/t/{shortcode}"
+        started = time.monotonic()
+        try:
+            response = await self._session.get(
+                url,
+                headers={**self._headers, "Referer": f"{self.BASE_URL}/"},
+                timeout=15,
+            )
+        except Exception as exc:
+            logger.warning("Threads HTTP fetch failed for %s: %s", shortcode, exc)
+            raise HttpExtractionUnavailable("transport_error") from exc
+
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        status = response.status_code
+        logger.info("Threads HTTP fetch code=%s status=%s duration_ms=%s", shortcode, status, elapsed_ms)
+
+        if status == 404:
+            raise NotFoundError(f"Post {shortcode} not found or is private")
+        if status in (401, 403, 429):
+            raise HttpExtractionUnavailable(f"http_{status}", status)
+        if status >= 500:
+            raise RateLimitError(f"Threads returned HTTP {status}")
+        if status >= 400:
+            raise HttpExtractionUnavailable(f"http_{status}", status)
+
+        parsed = ThreadsPostParser.parse_html(response.text, shortcode)
+        if parsed:
+            logger.info("Threads extraction path=http code=%s duration_ms=%s", shortcode, elapsed_ms)
+            return parsed
+        raise HttpExtractionUnavailable("missing_post_payload", status)
+
+    async def close(self) -> None:
+        await self._session.close()
+
+
 class ThreadsCloakScraper:
     """
     Scrapes Threads.net via CloakBrowser (stealth Chromium).
@@ -45,7 +170,34 @@ class ThreadsCloakScraper:
     BASE_URL = "https://www.threads.com"
 
     def __init__(self):
-        self._impersonate = "chrome124"
+        self._impersonate = "chrome"
+        self._browser = None
+        self._launch_lock = asyncio.Lock()
+        self._semaphore = asyncio.Semaphore(int(os.getenv("THREADS_BROWSER_CONCURRENCY", "2")))
+
+    async def _get_browser(self):
+        if self._browser is not None:
+            return self._browser
+
+        async with self._launch_lock:
+            if self._browser is not None:
+                return self._browser
+            try:
+                logger.info("Launching shared CloakBrowser")
+                self._browser = await launch_async(
+                    headless=True,
+                    humanize=True,
+                    args=[
+                        "--disable-gpu",
+                        "--window-size=1280,720",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
+            except Exception as exc:
+                logger.error("CloakBrowser launch failed: %s", exc)
+                raise RateLimitError(f"Browser launch failed: {exc}") from exc
+            return self._browser
 
     async def scrape_post(self, shortcode: str) -> dict:
         """
@@ -54,24 +206,13 @@ class ThreadsCloakScraper:
         Returns a flattened dict compatible with parse_thread_item().
         """
         url = f"{self.BASE_URL}/t/{shortcode}"
-        browser = None
+        async with self._semaphore:
+            return await self._scrape_with_page(shortcode, url)
 
-        try:
-            logger.info("Launching CloakBrowser for %s", shortcode)
-            browser = await launch_async(
-                headless=True,
-                humanize=True,
-                args=[
-                    "--disable-gpu",
-                    "--window-size=1280,720",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            )
-        except Exception as e:
-            logger.error("CloakBrowser launch failed: %s", e)
-            raise RateLimitError(f"Browser launch failed: {e}") from e
-
+    async def _scrape_with_page(self, shortcode: str, url: str) -> dict:
+        browser = await self._get_browser()
+        page = None
+        started = time.monotonic()
         try:
             page = await browser.new_page()
             graphql_responses: list[dict] = []
@@ -103,8 +244,8 @@ class ThreadsCloakScraper:
                 if status in (401, 403, 429) or status >= 500:
                     raise RateLimitError(f"Threads returned HTTP {status} (IP block detected)")
 
-            # Allow pending response handlers to finish + JS hydration
-            await asyncio.sleep(2.0)
+            # Let callbacks run without imposing the previous fixed delay.
+            await asyncio.sleep(0)
             if response_tasks:
                 await asyncio.gather(*response_tasks, return_exceptions=True)
 
@@ -125,9 +266,14 @@ class ThreadsCloakScraper:
             if not thread_data:
                 raise NotFoundError(f"Post {shortcode} not found or is private")
 
+            logger.info(
+                "Threads extraction path=browser code=%s duration_ms=%s",
+                shortcode,
+                round((time.monotonic() - started) * 1000),
+            )
             return thread_data
 
-        except NotFoundError:
+        except (NotFoundError, RateLimitError):
             raise
         except Exception as e:
             error_msg = str(e).lower()
@@ -135,10 +281,20 @@ class ThreadsCloakScraper:
                 raise RateLimitError(f"Page load error: {e}") from e
             raise ScraperError(f"Extraction failed: {e}") from e
         finally:
-            try:
-                await browser.close()
-            except Exception as e:
-                logger.warning("Browser close error: %s", e)
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception as exc:
+                    logger.warning("Browser page close error: %s", exc)
+
+    async def close(self) -> None:
+        async with self._launch_lock:
+            browser, self._browser = self._browser, None
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception as exc:
+                    logger.warning("Browser close error: %s", exc)
 
     # ------------------------------------------------------------------
     # Extraction helpers
@@ -305,14 +461,16 @@ class ThreadsCloakScraper:
     @staticmethod
     def _media_node(node: dict) -> dict:
         """Single media item parser."""
-        is_video = node.get("is_video", False)
-
         video_url = node.get("video_url")
         if not video_url:
             video_versions = node.get("video_versions") or []
             if isinstance(video_versions, list) and video_versions:
                 first = video_versions[0] or {}
                 video_url = first.get("url") if isinstance(first, dict) else None
+
+        # Current server-rendered payloads identify videos with media_type=2
+        # and video_versions, but often omit the legacy is_video boolean.
+        is_video = bool(node.get("is_video") or node.get("media_type") == 2 or video_url)
 
         image_url = None
         image_versions = node.get("image_versions2") or {}
@@ -322,12 +480,15 @@ class ThreadsCloakScraper:
             if isinstance(first, dict):
                 image_url = first.get("url")
 
-        return {
+        parsed = {
             "type": "video" if is_video else "image",
             "url": video_url if is_video else image_url,
             "width": node.get("original_width"),
             "height": node.get("original_height"),
         }
+        if is_video:
+            parsed["thumbnail_url"] = image_url
+        return parsed
 
     # ------------------------------------------------------------------
     # Direct media download (kept for compatibility)
@@ -340,3 +501,47 @@ class ThreadsCloakScraper:
             resp.raise_for_status()
             with open(dest, "wb") as f:
                 f.write(resp.content)
+
+
+class ThreadsScraper:
+    """Use server-rendered JSON first and render only gated responses."""
+
+    def __init__(
+        self,
+        http_extractor: ThreadsHttpExtractor | None = None,
+        browser_fallback: ThreadsCloakScraper | None = None,
+    ):
+        self.http = http_extractor or ThreadsHttpExtractor()
+        self.browser = browser_fallback or ThreadsCloakScraper()
+        self._metrics: Counter[str] = Counter()
+
+    async def scrape_post(self, shortcode: str) -> dict:
+        try:
+            result = await self.http.scrape_post(shortcode)
+            self._metrics["http_success"] += 1
+            return result
+        except HttpExtractionUnavailable as exc:
+            self._metrics["http_unavailable"] += 1
+            self._metrics[f"fallback_{exc.reason}"] += 1
+            logger.warning(
+                "Threads extraction fallback code=%s reason=%s status=%s",
+                shortcode,
+                exc.reason,
+                exc.status_code,
+            )
+            try:
+                result = await self.browser.scrape_post(shortcode)
+                self._metrics["browser_success"] += 1
+                return result
+            except Exception as browser_exc:
+                self._metrics[f"browser_error_{type(browser_exc).__name__}"] += 1
+                raise
+        except Exception as exc:
+            self._metrics[f"http_error_{type(exc).__name__}"] += 1
+            raise
+
+    def metrics_snapshot(self) -> dict[str, int]:
+        return dict(self._metrics)
+
+    async def close(self) -> None:
+        await asyncio.gather(self.http.close(), self.browser.close())

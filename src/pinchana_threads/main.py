@@ -11,7 +11,7 @@ from pinchana_core.models import ScrapeRequest, ScrapeResponse, MediaItem
 from pinchana_core.storage import MediaStorage
 from pinchana_core.vpn import GluetunController, VpnRotationError
 from pinchana_core.plugins import ScraperPlugin, registry
-from .scraper import ThreadsCloakScraper, RateLimitError, NotFoundError
+from .scraper import ThreadsScraper, RateLimitError, NotFoundError
 
 
 class ThreadsScrapeResponse(ScrapeResponse):
@@ -31,7 +31,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-scraper = ThreadsCloakScraper()
+scraper = ThreadsScraper()
 gluetun = GluetunController()
 storage = MediaStorage(
     base_path=os.getenv("CACHE_PATH", "./cache"),
@@ -96,6 +96,28 @@ def extract_post_id(url: str) -> str:
     return match.group(1)
 
 
+def _normalize_image_path(path):
+    """Rename an image to match its bytes when CDN content negotiation changes format."""
+    if not path.exists():
+        return path
+
+    with open(path, "rb") as image_file:
+        header = image_file.read(12)
+
+    if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        extension = ".webp"
+    elif header.startswith(b"\x89PNG\r\n\x1a\n"):
+        extension = ".png"
+    else:
+        extension = ".jpg"
+
+    if path.suffix == extension:
+        return path
+    normalized = path.with_suffix(extension)
+    path.replace(normalized)
+    return normalized
+
+
 async def _download_media(post_id: str, media_list: list[dict]) -> list[MediaItem]:
     """Download all media for a post and return MediaItem descriptors."""
     storage.prepare_post_dir(post_id)
@@ -111,6 +133,11 @@ async def _download_media(post_id: str, media_list: list[dict]) -> list[MediaIte
         tasks.append(storage.download(media_url, dest))
         mapping.append((idx, ext))
 
+        thumbnail_url = item.get("thumbnail_url")
+        if ext == "mp4" and thumbnail_url:
+            thumbnail_dest = storage.base_path / post_id / f"media_{idx}.jpg"
+            tasks.append(storage.download(thumbnail_url, thumbnail_dest))
+
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for r in results:
         if isinstance(r, Exception):
@@ -118,12 +145,24 @@ async def _download_media(post_id: str, media_list: list[dict]) -> list[MediaIte
 
     items = []
     for idx, ext in mapping:
-        path = storage.base_path / post_id / f"media_{idx}.{ext}"
+        media_path = storage.base_path / post_id / f"media_{idx}.{ext}"
+        thumbnail_path = storage.base_path / post_id / f"media_{idx}.jpg"
+        if not media_path.exists():
+            continue
+        if ext == "jpg":
+            media_path = _normalize_image_path(media_path)
+            thumbnail_path = media_path
+        elif thumbnail_path.exists():
+            thumbnail_path = _normalize_image_path(thumbnail_path)
         items.append(
             MediaItem(
                 index=idx,
                 media_type="video" if ext == "mp4" else "image",
-                thumbnail_url=f"/media/threads/{post_id}/media_{idx}.jpg" if ext == "jpg" else None,
+                thumbnail_url=(
+                    f"/media/threads/{post_id}/{thumbnail_path.name}"
+                    if thumbnail_path.exists()
+                    else ""
+                ),
                 video_url=f"/media/threads/{post_id}/media_{idx}.mp4" if ext == "mp4" else None,
             )
         )
@@ -234,7 +273,12 @@ async def health_check():
         vpn_status = status.get("status", "").lower()
         if gluetun.enabled and vpn_status != "running":
             raise HTTPException(status_code=503, detail=f"VPN not running: {vpn_status}")
-        return {"status": "healthy", "service": "threads", "vpn": status}
+        return {
+            "status": "healthy",
+            "service": "threads",
+            "vpn": status,
+            "extraction": scraper.metrics_snapshot(),
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -257,4 +301,4 @@ app.include_router(router)
 
 @app.on_event("shutdown")
 async def close_storage_client():
-    await storage.close()
+    await asyncio.gather(storage.close(), scraper.close())

@@ -21,13 +21,14 @@ COPY pinchana-core/src ../pinchana-core/src
 COPY pinchana-threads/pyproject.toml pinchana-threads/uv.lock pinchana-threads/README.md ./
 RUN uv sync --frozen --no-install-project
 
-COPY pinchana-threads/src ./src
-
-# Install the local project + pre-download CloakBrowser stealth binary
-RUN uv sync --frozen && \
-    uv run python -c "from cloakbrowser.browser import ensure_binary; ensure_binary()" || true
+# Cache the large fallback-browser layer independently from application source.
+RUN .venv/bin/python -c "from cloakbrowser.browser import ensure_binary; ensure_binary()" || true
 
 RUN mkdir -p /app/cache
+
+COPY pinchana-threads/src ./src
+RUN uv sync --frozen
+
 ENV CACHE_PATH=/app/cache
 ENV CACHE_MAX_SIZE_GB=10.0
 ENV CLOAKBROWSER_AUTO_UPDATE=false
