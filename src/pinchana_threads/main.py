@@ -246,7 +246,7 @@ registry.register(
     ScraperPlugin(
         name="threads",
         router=router,
-        route_patterns=["threads.com"],
+        route_patterns=["threads.net", "threads.com"],
     )
 )
 
