@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Optional
 from fastapi import APIRouter, HTTPException, FastAPI
 from fastapi.responses import FileResponse
@@ -25,6 +26,8 @@ class ThreadsScrapeResponse(ScrapeResponse):
     spoiler: bool = False
     text_spoiler: bool = False
     text_html: Optional[str] = None
+    taken_at: Optional[int] = None
+    music: Optional[dict] = None
 
 
 logging.basicConfig(level=logging.INFO)
@@ -60,7 +63,7 @@ def _cached_media_ready(metadata: dict) -> bool:
         return False
 
     urls: list[str] = []
-    for key in ("thumbnail_url", "video_url"):
+    for key in ("thumbnail_url", "video_url", "audio_url", "cover_url"):
         url = metadata.get(key)
         if url:
             urls.append(url)
@@ -74,6 +77,13 @@ def _cached_media_ready(metadata: dict) -> bool:
                 url = item.get(key)
                 if url:
                     urls.append(url)
+
+    music = metadata.get("music") or {}
+    if isinstance(music, dict):
+        for key in ("audio_url", "cover_url"):
+            url = music.get(key)
+            if url:
+                urls.append(url)
 
     for url in urls:
         path = _media_url_to_path(url)
@@ -169,11 +179,107 @@ async def _download_media(post_id: str, media_list: list[dict]) -> list[MediaIte
     return items
 
 
+async def _run_ffmpeg_preview(
+    source: Path,
+    destination: Path,
+    *,
+    start_seconds: float,
+    duration_seconds: float,
+) -> bool:
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{start_seconds:.3f}",
+        "-i",
+        str(source),
+        "-t",
+        f"{duration_seconds:.3f}",
+        "-vn",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        str(destination),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        logger.warning(
+            "Threads music preview extraction failed: %s",
+            stderr.decode(errors="replace").strip(),
+        )
+        destination.unlink(missing_ok=True)
+        return False
+    return destination.is_file() and destination.stat().st_size > 0
+
+
+async def _download_music(post_id: str, music: dict | None) -> dict | None:
+    """Cache a 30-second Threads music preview and its artwork."""
+    if not isinstance(music, dict) or not music.get("source_url"):
+        return None
+
+    try:
+        start_seconds = max(0.0, float(music.get("start_time_ms") or 0) / 1000)
+        source_duration = music.get("source_duration_seconds")
+        remaining = (
+            max(0.0, float(source_duration) - start_seconds)
+            if source_duration is not None
+            else 30.0
+        )
+        clip_duration = min(30.0, remaining)
+    except (TypeError, ValueError):
+        start_seconds = 0.0
+        clip_duration = 30.0
+    if clip_duration <= 0:
+        return None
+
+    post_dir = storage.base_path / post_id
+    post_dir.mkdir(parents=True, exist_ok=True)
+    source_path = post_dir / "music_source.mp4"
+    preview_path = post_dir / "music_preview.m4a"
+    cover_path = post_dir / "music_cover.jpg"
+
+    if not await storage.download(str(music["source_url"]), source_path):
+        return None
+    try:
+        if not await _run_ffmpeg_preview(
+            source_path,
+            preview_path,
+            start_seconds=start_seconds,
+            duration_seconds=clip_duration,
+        ):
+            return None
+    finally:
+        source_path.unlink(missing_ok=True)
+
+    cover_url = None
+    if music.get("artwork_url") and await storage.download(
+        str(music["artwork_url"]), cover_path
+    ):
+        cover_path = _normalize_image_path(cover_path)
+        cover_url = f"/media/threads/{post_id}/{cover_path.name}"
+
+    return {
+        "audio_url": f"/media/threads/{post_id}/{preview_path.name}",
+        "cover_url": cover_url,
+        "title": music.get("title"),
+        "artist": music.get("artist"),
+        "song_id": music.get("song_id"),
+        "duration_seconds": max(1, int(clip_duration)),
+        "start_time_seconds": int(start_seconds),
+    }
+
+
 async def _scrape_post(code: str) -> ThreadsScrapeResponse:
     """Scrape a single Threads post by its URL shortcode."""
     parsed = await scraper.scrape_post(code)
 
     media_items = await _download_media(code, parsed.get("media") or [])
+    music = await _download_music(code, parsed.get("music"))
 
     response = ThreadsScrapeResponse(
         shortcode=code,
@@ -192,6 +298,8 @@ async def _scrape_post(code: str) -> ThreadsScrapeResponse:
         spoiler=bool(parsed.get("spoiler")),
         text_spoiler=bool(parsed.get("text_spoiler")),
         text_html=parsed.get("text_html"),
+        taken_at=parsed.get("taken_at"),
+        music=music,
     )
     storage.save_metadata(code, response.model_dump())
     return response

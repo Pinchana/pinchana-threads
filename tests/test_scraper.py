@@ -33,6 +33,24 @@ POST = {
     },
 }
 
+MUSIC = {
+    "text_app_music_info": {
+        "music_consumable_video": {
+            "audio_start_time_in_ms": 149000,
+            "audio_metadata": {
+                "audio_asset_id": "asset-1",
+                "audio_asset": {
+                    "dash_manifest": """<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" mediaPresentationDuration="PT218.4S"><Period><AdaptationSet><Representation><BaseURL>https://cdn.example/song.mp4?a=1&amp;b=2</BaseURL></Representation></AdaptationSet></Period></MPD>""",
+                    "display_title": {"text": "Kalinka"},
+                    "display_artist": {"text": "Russian Balalaika Orchestra"},
+                    "song_id": "song-1",
+                    "large_display_image": {"downloadable_uri": "https://cdn.example/cover.jpg"},
+                },
+            },
+        }
+    }
+}
+
 
 class FakeResponse:
     def __init__(self, status_code=200, text=""):
@@ -114,6 +132,41 @@ def test_video_is_detected_from_current_media_type_and_versions():
     ]
 
 
+def test_music_is_parsed_from_text_app_graphql_payload():
+    parsed = ThreadsCloakScraper.parse_thread_item({**POST, **MUSIC})
+
+    assert parsed["music"] == {
+        "source_url": "https://cdn.example/song.mp4?a=1&b=2",
+        "title": "Kalinka",
+        "artist": "Russian Balalaika Orchestra",
+        "artwork_url": "https://cdn.example/cover.jpg",
+        "song_id": "song-1",
+        "audio_asset_id": "asset-1",
+        "start_time_ms": 149000,
+        "source_duration_seconds": 218.4,
+    }
+
+
+def test_invalid_music_manifest_is_ignored():
+    broken = {
+        "text_app_music_info": {
+            "music_consumable_video": {
+                "audio_metadata": {"audio_asset": {"dash_manifest": "<broken"}}
+            }
+        }
+    }
+    assert ThreadsCloakScraper._parse_music(broken) is None
+
+
+def test_unavailable_music_is_ignored():
+    unavailable = {**POST, **MUSIC}
+    unavailable["text_app_music_info"] = {
+        **MUSIC["text_app_music_info"],
+        "is_available_for_consumption": False,
+    }
+    assert ThreadsCloakScraper._parse_music(unavailable) is None
+
+
 @pytest.mark.asyncio
 async def test_http_extractor_returns_post_without_browser():
     session = FakeSession(FakeResponse(text=post_html()))
@@ -168,6 +221,63 @@ async def test_download_uses_detected_webp_extension(monkeypatch, tmp_path):
 
     assert items[0].thumbnail_url == f"/media/threads/{SHORTCODE}/media_0.webp"
     assert (tmp_path / SHORTCODE / "media_0.webp").exists()
+
+
+@pytest.mark.asyncio
+async def test_music_download_extracts_30_second_preview_and_cover(monkeypatch, tmp_path):
+    async def fake_download(url, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"source" if "song" in url else b"cover")
+        return True
+
+    ffmpeg_call = {}
+
+    async def fake_ffmpeg(source, destination, *, start_seconds, duration_seconds):
+        ffmpeg_call.update(start=start_seconds, duration=duration_seconds)
+        destination.write_bytes(b"preview")
+        return True
+
+    monkeypatch.setattr(main_module.storage, "base_path", tmp_path)
+    monkeypatch.setattr(main_module.storage, "download", fake_download)
+    monkeypatch.setattr(main_module, "_run_ffmpeg_preview", fake_ffmpeg)
+
+    music = await main_module._download_music(
+        SHORTCODE,
+        ThreadsCloakScraper._parse_music({**POST, **MUSIC}),
+    )
+
+    assert ffmpeg_call == {"start": 149.0, "duration": 30.0}
+    assert music["audio_url"] == f"/media/threads/{SHORTCODE}/music_preview.m4a"
+    assert music["cover_url"] == f"/media/threads/{SHORTCODE}/music_cover.jpg"
+    assert music["title"] == "Kalinka"
+    assert music["duration_seconds"] == 30
+    assert not (tmp_path / SHORTCODE / "music_source.mp4").exists()
+
+
+@pytest.mark.asyncio
+async def test_music_preview_is_clamped_to_track_end(monkeypatch, tmp_path):
+    async def fake_download(url, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"source")
+        return True
+
+    durations = []
+
+    async def fake_ffmpeg(source, destination, *, start_seconds, duration_seconds):
+        durations.append(duration_seconds)
+        destination.write_bytes(b"preview")
+        return True
+
+    monkeypatch.setattr(main_module.storage, "base_path", tmp_path)
+    monkeypatch.setattr(main_module.storage, "download", fake_download)
+    monkeypatch.setattr(main_module, "_run_ffmpeg_preview", fake_ffmpeg)
+    music = ThreadsCloakScraper._parse_music({**POST, **MUSIC})
+    music["start_time_ms"] = 215000
+
+    result = await main_module._download_music(SHORTCODE, music)
+
+    assert durations == pytest.approx([3.4])
+    assert result["duration_seconds"] == 3
 
 
 @pytest.mark.asyncio

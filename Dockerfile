@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libatk-bridge2.0-0 libxss1 libgtk-3-0 \
     libasound2 libxtst6 libgbm1 libxshmfence1 \
     libxcomposite1 libxdamage1 libxrandr2 libpangocairo-1.0-0 \
-    fonts-liberation libcurl4 \
+    fonts-liberation libcurl4 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy pinchana-core (local path dependency) first

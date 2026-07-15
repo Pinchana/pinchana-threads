@@ -5,10 +5,12 @@ import html
 import json
 import logging
 import os
+import re
 import time
 from collections import Counter
 from html.parser import HTMLParser
 from typing import Optional
+from xml.etree import ElementTree
 
 from curl_cffi.requests import AsyncSession
 from cloakbrowser import launch_async
@@ -401,6 +403,7 @@ class ThreadsCloakScraper:
             "text": caption_text,
             "text_html": caption_html,
             "text_spoiler": text_spoiler,
+            "music": ThreadsCloakScraper._parse_music(raw),
             "taken_at": raw.get("taken_at"),
             "like_count": raw.get("like_count"),
             "reply_count": text_post_app_info.get("reply_count") or text_post_app_info.get("direct_reply_count"),
@@ -410,6 +413,56 @@ class ThreadsCloakScraper:
             "link": link_url,
             "spoiler": bool(text_post_app_info.get("is_spoiler_media")),
             "media": ThreadsCloakScraper._parse_media_items(raw),
+        }
+
+    @staticmethod
+    def _parse_music(raw: dict) -> dict | None:
+        """Extract the playable music attachment embedded in a Threads post."""
+        music_info = raw.get("text_app_music_info") or {}
+        if music_info.get("is_available_for_consumption") is False:
+            return None
+        consumable = music_info.get("music_consumable_video") or {}
+        metadata = consumable.get("audio_metadata") or {}
+        asset = metadata.get("audio_asset") or {}
+        manifest = asset.get("dash_manifest")
+        if not manifest:
+            return None
+
+        audio_url = None
+        duration_seconds = None
+        try:
+            root = ElementTree.fromstring(manifest)
+            duration = root.attrib.get("mediaPresentationDuration") or ""
+            match = re.fullmatch(r"PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?", duration)
+            if match:
+                hours, minutes, seconds = (float(value or 0) for value in match.groups())
+                duration_seconds = hours * 3600 + minutes * 60 + seconds
+            for element in root.iter():
+                if element.tag.rsplit("}", 1)[-1] == "BaseURL" and element.text:
+                    audio_url = element.text.strip()
+                    break
+        except (ElementTree.ParseError, TypeError, ValueError):
+            logger.warning("Threads music attachment has an invalid DASH manifest")
+            return None
+
+        if not audio_url:
+            return None
+
+        title = (asset.get("display_title") or {}).get("text")
+        artist = (asset.get("display_artist") or {}).get("text")
+        artwork = (
+            (asset.get("large_display_image") or {}).get("downloadable_uri")
+            or (asset.get("display_image") or {}).get("downloadable_uri")
+        )
+        return {
+            "source_url": audio_url,
+            "title": title,
+            "artist": artist,
+            "artwork_url": artwork,
+            "song_id": asset.get("song_id"),
+            "audio_asset_id": metadata.get("audio_asset_id"),
+            "start_time_ms": consumable.get("audio_start_time_in_ms") or 0,
+            "source_duration_seconds": duration_seconds,
         }
 
     @staticmethod
