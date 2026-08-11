@@ -4,8 +4,12 @@ import asyncio
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
+
+import httpx
 from fastapi import APIRouter, HTTPException, FastAPI
 from fastapi.responses import FileResponse
 from pinchana_core.models import ScrapeRequest, ScrapeResponse, MediaItem
@@ -104,6 +108,62 @@ def extract_post_id(url: str) -> str:
     if not match:
         raise HTTPException(status_code=400, detail="Invalid Threads URL format.")
     return match.group(1)
+
+
+async def resolve_post_id(
+    url: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> str:
+    """Resolve a Threads share alias and return its canonical post shortcode."""
+    try:
+        return extract_post_id(url)
+    except HTTPException as invalid_url:
+        parsed = urlsplit(url)
+        if (
+            parsed.hostname not in {"threads.com", "www.threads.com", "threads.net", "www.threads.net"}
+            or not re.fullmatch(r"/share/[^/]+/?", parsed.path)
+        ):
+            raise invalid_url
+
+    owns_client = client is None
+    if client is None:
+        client = httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+
+    try:
+        response = await client.head(url)
+        if response.status_code == 405:
+            response = await client.get(url)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        status = 404 if exc.response.status_code == 404 else 503
+        raise HTTPException(
+            status_code=status,
+            detail="Threads share link could not be resolved.",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Threads share link resolution is temporarily unavailable.",
+        ) from exc
+    finally:
+        if owns_client:
+            await client.aclose()
+
+    canonical_url = str(response.url)
+    canonical_host = urlsplit(canonical_url).hostname
+    if canonical_host not in {
+        "threads.com",
+        "www.threads.com",
+        "threads.net",
+        "www.threads.net",
+    }:
+        raise HTTPException(status_code=400, detail="Invalid Threads share redirect.")
+    return extract_post_id(canonical_url)
 
 
 def _normalize_image_path(path):
@@ -305,9 +365,7 @@ async def _scrape_post(code: str) -> ThreadsScrapeResponse:
     return response
 
 
-async def _process_scrape_request(request: ScrapeRequest):
-    code = extract_post_id(str(request.url))
-
+async def _process_scrape_request(code: str):
     if storage.is_cached(code):
         cached = storage.load_metadata(code)
         if cached and _cached_media_ready(cached):
@@ -351,8 +409,8 @@ async def _process_scrape_request(request: ScrapeRequest):
 
 @router.post("/scrape", response_model=ThreadsScrapeResponse)
 async def process_scrape_request(request: ScrapeRequest):
-    code = extract_post_id(str(request.url))
-    return await storage.singleflight(code, lambda: _process_scrape_request(request))
+    code = await resolve_post_id(str(request.url))
+    return await storage.singleflight(code, lambda: _process_scrape_request(code))
 
 
 @router.get("/media/{platform}/{post_id}/{filename:path}")
@@ -402,11 +460,15 @@ registry.register(
     )
 )
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Release shared storage and scraper clients when the service stops."""
+    try:
+        yield
+    finally:
+        await asyncio.gather(storage.close(), scraper.close())
+
+
 # Standalone FastAPI app for container mode
-app = FastAPI(title="Pinchana Threads", version="0.1.0")
+app = FastAPI(title="Pinchana Threads", version="0.1.0", lifespan=lifespan)
 app.include_router(router)
-
-
-@app.on_event("shutdown")
-async def close_storage_client():
-    await asyncio.gather(storage.close(), scraper.close())
