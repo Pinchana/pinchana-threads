@@ -1,6 +1,6 @@
 [project]
 name = "pinchana-threads"
-version = "0.2b0"
+version = "26.8.1"
 description = "Threads (Meta) scraper plugin for Pinchana"
 readme = "README.md"
 requires-python = ">=3.13"
