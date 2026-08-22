@@ -883,7 +883,7 @@ wheels = [
 
 [[package]]
 name = "pinchana-core"
-version = "26.8.4"
+version = "26.8.5"
 source = { directory = "../pinchana-core" }
 dependencies = [
     { name = "aiohttp" },
@@ -912,7 +912,7 @@ requires-dist = [
 
 [[package]]
 name = "pinchana-threads"
-version = "26.8.4"
+version = "26.8.5"
 source = { editable = "." }
 dependencies = [
     { name = "cloakbrowser" },
