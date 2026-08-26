@@ -235,6 +235,19 @@ async def test_video_download_includes_mp4_and_cover(monkeypatch, tmp_path):
     assert items[0].video_url == f"/media/threads/{SHORTCODE}/media_0.mp4"
     assert items[0].thumbnail_url == f"/media/threads/{SHORTCODE}/media_0.jpg"
 
+    quoted = await main_module._download_media(
+        SHORTCODE,
+        [{"type": "image", "url": "https://cdn.example/quoted.jpg"}],
+        filename_prefix="quote_",
+    )
+
+    assert quoted[0].thumbnail_url == (
+        f"/media/threads/{SHORTCODE}/quote_media_0.jpg"
+    )
+    assert (tmp_path / SHORTCODE / "media_0.mp4").is_file()
+    assert (tmp_path / SHORTCODE / "media_0.jpg").is_file()
+    assert (tmp_path / SHORTCODE / "quote_media_0.jpg").is_file()
+
 
 @pytest.mark.asyncio
 async def test_download_uses_detected_webp_extension(monkeypatch, tmp_path):

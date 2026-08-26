@@ -238,7 +238,10 @@ async def _download_media(
     filename_prefix: str = "",
 ) -> list[MediaItem]:
     """Download all media for a post and return MediaItem descriptors."""
-    storage.prepare_post_dir(post_id)
+    # Main and quoted media share one post directory. Only the scrape entry
+    # point may clear an incomplete directory; doing it per media pass removes
+    # the main files before quote metadata is saved.
+    (storage.base_path / post_id).mkdir(parents=True, exist_ok=True)
     tasks = []
     mapping: list[tuple[int, str]] = []
 
@@ -462,6 +465,7 @@ async def _response_from_parsed(
 async def _scrape_post(code: str) -> ThreadsScrapeResponse:
     """Scrape a single Threads post by its URL shortcode."""
     parsed = await _parsed_post(code)
+    storage.prepare_post_dir(code)
     response = await _response_from_parsed(code, parsed, download_media=True)
     metadata = response.model_dump()
     metadata["_cache_version"] = THREADS_CACHE_VERSION
