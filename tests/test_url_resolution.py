@@ -15,7 +15,9 @@ def test_extract_post_id_accepts_canonical_threads_urls():
 @pytest.mark.asyncio
 async def test_resolve_post_id_follows_threads_share_redirect():
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/share/EDWq4NzzE/":
+        if request.url.path == "/share/_lPHF4BP-":
+            if request.method == "HEAD":
+                return httpx.Response(200)
             return httpx.Response(
                 302,
                 headers={
@@ -32,7 +34,7 @@ async def test_resolve_post_id_follows_threads_share_redirect():
         follow_redirects=True,
     ) as client:
         post_id = await resolve_post_id(
-            "https://www.threads.com/share/EDWq4NzzE/",
+            "https://www.threads.com/share/_lPHF4BP-",
             client=client,
         )
 
