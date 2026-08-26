@@ -410,6 +410,8 @@ class ThreadsCloakScraper:
             "repost_count": text_post_app_info.get("repost_count"),
             "quote_count": text_post_app_info.get("quote_count"),
             "username": user.get("username"),
+            "author_name": user.get("full_name"),
+            "avatar_url": user.get("profile_pic_url"),
             "link": link_url,
             "spoiler": bool(text_post_app_info.get("is_spoiler_media")),
             "media": ThreadsCloakScraper._parse_media_items(raw),

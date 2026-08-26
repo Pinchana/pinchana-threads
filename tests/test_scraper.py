@@ -21,7 +21,11 @@ POST = {
     "pk": "123456789",
     "code": SHORTCODE,
     "caption": {"text": "hello & goodbye"},
-    "user": {"username": "pinchana"},
+    "user": {
+        "username": "pinchana",
+        "full_name": "Pinchana",
+        "profile_pic_url": "https://cdn.example/avatar.jpg",
+    },
     "like_count": 12,
     "text_post_app_info": {
         "reply_count": 3,
@@ -93,6 +97,8 @@ def test_parse_server_rendered_post():
     assert parsed["code"] == SHORTCODE
     assert parsed["text"] == "hello & goodbye"
     assert parsed["username"] == "pinchana"
+    assert parsed["author_name"] == "Pinchana"
+    assert parsed["avatar_url"] == "https://cdn.example/avatar.jpg"
     assert parsed["reply_count"] == 3
     assert parsed["media"] == [
         {

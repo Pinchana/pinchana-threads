@@ -25,6 +25,8 @@ class ThreadsScrapeResponse(ScrapeResponse):
     """Extended response for Threads including link preview and engagement."""
     link: Optional[str] = None
     username: Optional[str] = None
+    author_name: Optional[str] = None
+    avatar_url: Optional[str] = None
     like_count: Optional[int] = None
     reply_count: Optional[int] = None
     repost_count: Optional[int] = None
@@ -47,7 +49,7 @@ storage = MediaStorage(
     base_path=os.getenv("CACHE_PATH", "./cache"),
     max_size_gb=float(os.getenv("CACHE_MAX_SIZE_GB", "10.0")),
 )
-THREADS_CACHE_VERSION = 2
+THREADS_CACHE_VERSION = 3
 
 
 class _InspectionCache:
@@ -435,13 +437,15 @@ async def _response_from_parsed(
     return ThreadsScrapeResponse(
         shortcode=str(parsed.get("code") or code),
         caption=parsed.get("text") or "",
-        author=parsed.get("username") or "",
+        author=parsed.get("author_name") or parsed.get("username") or "",
         media_type=("video" if any(m.media_type == "video" for m in media_items) else ("image" if media_items else "text")),
         thumbnail_url=media_items[0].thumbnail_url if media_items else "",
         video_url=media_items[0].video_url if media_items else None,
         carousel=media_items if len(media_items) > 1 else None,
         link=parsed.get("link"),
         username=parsed.get("username"),
+        author_name=parsed.get("author_name"),
+        avatar_url=parsed.get("avatar_url"),
         like_count=parsed.get("like_count"),
         reply_count=parsed.get("reply_count"),
         repost_count=parsed.get("repost_count"),
