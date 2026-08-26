@@ -147,6 +147,32 @@ def test_music_is_parsed_from_text_app_graphql_payload():
     }
 
 
+def test_quoted_post_is_parsed_once_with_its_music_and_media():
+    nested = {
+        **POST,
+        "pk": "quoted-pk",
+        "code": "Quoted123",
+        "caption": {"text": "quoted text"},
+        **MUSIC,
+    }
+    nested["text_post_app_info"] = {
+        "share_info": {"quoted_post": POST},
+    }
+    main = {**POST}
+    main["text_post_app_info"] = {
+        **POST["text_post_app_info"],
+        "share_info": {"quoted_post": nested},
+    }
+
+    parsed = ThreadsCloakScraper.parse_thread_item(main)
+
+    assert parsed["quote"]["code"] == "Quoted123"
+    assert parsed["quote"]["text"] == "quoted text"
+    assert parsed["quote"]["music"]["title"] == "Kalinka"
+    assert parsed["quote"]["media"][0]["type"] == "image"
+    assert "quote" not in parsed["quote"]
+
+
 def test_invalid_music_manifest_is_ignored():
     broken = {
         "text_app_music_info": {

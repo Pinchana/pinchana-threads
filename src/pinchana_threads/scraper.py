@@ -383,7 +383,7 @@ class ThreadsCloakScraper:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def parse_thread_item(raw: dict) -> dict:
+    def parse_thread_item(raw: dict, *, include_quote: bool = True) -> dict:
         """Flatten a single thread/post node."""
         text_post_app_info = raw.get("text_post_app_info") or {}
         user = raw.get("user") or {}
@@ -396,7 +396,7 @@ class ThreadsCloakScraper:
         caption_text = caption.get("text") if caption else None
         caption_html, text_spoiler = ThreadsCloakScraper._build_caption_html(text_post_app_info, caption_text)
 
-        return {
+        parsed = {
             "post_id": raw.get("pk"),
             "code": raw.get("code"),
             "url": f"https://www.threads.com/t/{raw.get('code')}" if raw.get("code") else None,
@@ -414,6 +414,18 @@ class ThreadsCloakScraper:
             "spoiler": bool(text_post_app_info.get("is_spoiler_media")),
             "media": ThreadsCloakScraper._parse_media_items(raw),
         }
+        if include_quote:
+            share_info = text_post_app_info.get("share_info") or {}
+            quoted_post = share_info.get("quoted_post")
+            parsed["quote"] = (
+                ThreadsCloakScraper.parse_thread_item(
+                    quoted_post,
+                    include_quote=False,
+                )
+                if isinstance(quoted_post, dict) and quoted_post
+                else None
+            )
+        return parsed
 
     @staticmethod
     def _parse_music(raw: dict) -> dict | None:

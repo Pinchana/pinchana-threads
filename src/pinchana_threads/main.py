@@ -4,6 +4,8 @@ import asyncio
 import logging
 import os
 import re
+import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -32,6 +34,7 @@ class ThreadsScrapeResponse(ScrapeResponse):
     text_html: Optional[str] = None
     taken_at: Optional[int] = None
     music: Optional[dict] = None
+    quote: Optional[dict] = None
 
 
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +47,33 @@ storage = MediaStorage(
     base_path=os.getenv("CACHE_PATH", "./cache"),
     max_size_gb=float(os.getenv("CACHE_MAX_SIZE_GB", "10.0")),
 )
+THREADS_CACHE_VERSION = 2
+
+
+class _InspectionCache:
+    def __init__(self, ttl: float = 300, max_entries: int = 256):
+        self.ttl = ttl
+        self.max_entries = max_entries
+        self.entries: OrderedDict[str, tuple[float, dict]] = OrderedDict()
+        self.lock = asyncio.Lock()
+
+    async def get(self, key: str) -> dict | None:
+        async with self.lock:
+            entry = self.entries.pop(key, None)
+            if not entry or time.monotonic() - entry[0] > self.ttl:
+                return None
+            self.entries[key] = entry
+            return entry[1]
+
+    async def put(self, key: str, value: dict) -> None:
+        async with self.lock:
+            self.entries.pop(key, None)
+            self.entries[key] = (time.monotonic(), value)
+            while len(self.entries) > self.max_entries:
+                self.entries.popitem(last=False)
+
+
+inspection_cache = _InspectionCache()
 
 
 def _media_url_to_path(url: str | None):
@@ -65,8 +95,25 @@ def _media_url_to_path(url: str | None):
 def _cached_media_ready(metadata: dict) -> bool:
     if not isinstance(metadata, dict):
         return False
+    if metadata.get("_cache_version") != THREADS_CACHE_VERSION:
+        return False
 
     urls: list[str] = []
+    payloads = [metadata]
+    if isinstance(metadata.get("quote"), dict):
+        payloads.append(metadata["quote"])
+    for payload in payloads:
+        _collect_media_urls(payload, urls)
+
+    for url in urls:
+        path = _media_url_to_path(url)
+        if not path or not path.exists():
+            return False
+
+    return True
+
+
+def _collect_media_urls(metadata: dict, urls: list[str]) -> None:
     for key in ("thumbnail_url", "video_url", "audio_url", "cover_url"):
         url = metadata.get(key)
         if url:
@@ -89,12 +136,6 @@ def _cached_media_ready(metadata: dict) -> bool:
             if url:
                 urls.append(url)
 
-    for url in urls:
-        path = _media_url_to_path(url)
-        if not path or not path.exists():
-            return False
-
-    return True
 
 
 def extract_post_id(url: str) -> str:
@@ -188,7 +229,12 @@ def _normalize_image_path(path):
     return normalized
 
 
-async def _download_media(post_id: str, media_list: list[dict]) -> list[MediaItem]:
+async def _download_media(
+    post_id: str,
+    media_list: list[dict],
+    *,
+    filename_prefix: str = "",
+) -> list[MediaItem]:
     """Download all media for a post and return MediaItem descriptors."""
     storage.prepare_post_dir(post_id)
     tasks = []
@@ -199,13 +245,13 @@ async def _download_media(post_id: str, media_list: list[dict]) -> list[MediaIte
         if not media_url:
             continue
         ext = "mp4" if item.get("type") == "video" else "jpg"
-        dest = storage.base_path / post_id / f"media_{idx}.{ext}"
+        dest = storage.base_path / post_id / f"{filename_prefix}media_{idx}.{ext}"
         tasks.append(storage.download(media_url, dest))
         mapping.append((idx, ext))
 
         thumbnail_url = item.get("thumbnail_url")
         if ext == "mp4" and thumbnail_url:
-            thumbnail_dest = storage.base_path / post_id / f"media_{idx}.jpg"
+            thumbnail_dest = storage.base_path / post_id / f"{filename_prefix}media_{idx}.jpg"
             tasks.append(storage.download(thumbnail_url, thumbnail_dest))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -215,8 +261,8 @@ async def _download_media(post_id: str, media_list: list[dict]) -> list[MediaIte
 
     items = []
     for idx, ext in mapping:
-        media_path = storage.base_path / post_id / f"media_{idx}.{ext}"
-        thumbnail_path = storage.base_path / post_id / f"media_{idx}.jpg"
+        media_path = storage.base_path / post_id / f"{filename_prefix}media_{idx}.{ext}"
+        thumbnail_path = storage.base_path / post_id / f"{filename_prefix}media_{idx}.jpg"
         if not media_path.exists():
             continue
         if ext == "jpg":
@@ -233,7 +279,7 @@ async def _download_media(post_id: str, media_list: list[dict]) -> list[MediaIte
                     if thumbnail_path.exists()
                     else ""
                 ),
-                video_url=f"/media/threads/{post_id}/media_{idx}.mp4" if ext == "mp4" else None,
+                video_url=f"/media/threads/{post_id}/{filename_prefix}media_{idx}.mp4" if ext == "mp4" else None,
             )
         )
     return items
@@ -277,7 +323,12 @@ async def _run_ffmpeg_preview(
     return destination.is_file() and destination.stat().st_size > 0
 
 
-async def _download_music(post_id: str, music: dict | None) -> dict | None:
+async def _download_music(
+    post_id: str,
+    music: dict | None,
+    *,
+    filename_prefix: str = "",
+) -> dict | None:
     """Cache a 30-second Threads music preview and its artwork."""
     if not isinstance(music, dict) or not music.get("source_url"):
         return None
@@ -299,9 +350,9 @@ async def _download_music(post_id: str, music: dict | None) -> dict | None:
 
     post_dir = storage.base_path / post_id
     post_dir.mkdir(parents=True, exist_ok=True)
-    source_path = post_dir / "music_source.mp4"
-    preview_path = post_dir / "music_preview.m4a"
-    cover_path = post_dir / "music_cover.jpg"
+    source_path = post_dir / f"{filename_prefix}music_source.mp4"
+    preview_path = post_dir / f"{filename_prefix}music_preview.m4a"
+    cover_path = post_dir / f"{filename_prefix}music_cover.jpg"
 
     if not await storage.download(str(music["source_url"]), source_path):
         return None
@@ -334,15 +385,55 @@ async def _download_music(post_id: str, music: dict | None) -> dict | None:
     }
 
 
-async def _scrape_post(code: str) -> ThreadsScrapeResponse:
-    """Scrape a single Threads post by its URL shortcode."""
-    parsed = await scraper.scrape_post(code)
+async def _parsed_post(code: str) -> dict:
+    parsed = await inspection_cache.get(code)
+    if parsed is None:
+        parsed = await scraper.scrape_post(code)
+        await inspection_cache.put(code, parsed)
+    return parsed
 
-    media_items = await _download_media(code, parsed.get("media") or [])
-    music = await _download_music(code, parsed.get("music"))
 
-    response = ThreadsScrapeResponse(
-        shortcode=code,
+async def _response_from_parsed(
+    code: str,
+    parsed: dict,
+    *,
+    download_media: bool,
+    filename_prefix: str = "",
+) -> ThreadsScrapeResponse:
+    media_items = (
+        await _download_media(
+            code,
+            parsed.get("media") or [],
+            filename_prefix=filename_prefix,
+        )
+        if download_media
+        else []
+    )
+    music = (
+        await _download_music(
+            code,
+            parsed.get("music"),
+            filename_prefix=filename_prefix,
+        )
+        if download_media
+        else None
+    )
+
+    quote_parsed = parsed.get("quote")
+    quote = None
+    if isinstance(quote_parsed, dict):
+        quote = (
+            await _response_from_parsed(
+                code,
+                quote_parsed,
+                download_media=download_media,
+                filename_prefix="quote_",
+            )
+        ).model_dump(exclude={"quote"})
+        quote["source_url"] = quote_parsed.get("url")
+
+    return ThreadsScrapeResponse(
+        shortcode=str(parsed.get("code") or code),
         caption=parsed.get("text") or "",
         author=parsed.get("username") or "",
         media_type=("video" if any(m.media_type == "video" for m in media_items) else ("image" if media_items else "text")),
@@ -360,9 +451,23 @@ async def _scrape_post(code: str) -> ThreadsScrapeResponse:
         text_html=parsed.get("text_html"),
         taken_at=parsed.get("taken_at"),
         music=music,
+        quote=quote,
     )
-    storage.save_metadata(code, response.model_dump())
+
+
+async def _scrape_post(code: str) -> ThreadsScrapeResponse:
+    """Scrape a single Threads post by its URL shortcode."""
+    parsed = await _parsed_post(code)
+    response = await _response_from_parsed(code, parsed, download_media=True)
+    metadata = response.model_dump()
+    metadata["_cache_version"] = THREADS_CACHE_VERSION
+    storage.save_metadata(code, metadata)
     return response
+
+
+async def _inspect_post(code: str) -> ThreadsScrapeResponse:
+    parsed = await _parsed_post(code)
+    return await _response_from_parsed(code, parsed, download_media=False)
 
 
 async def _process_scrape_request(code: str):
@@ -411,6 +516,20 @@ async def _process_scrape_request(code: str):
 async def process_scrape_request(request: ScrapeRequest):
     code = await resolve_post_id(str(request.url))
     return await storage.singleflight(code, lambda: _process_scrape_request(code))
+
+
+@router.post("/inspect", response_model=ThreadsScrapeResponse)
+async def inspect_post_request(request: ScrapeRequest):
+    code = await resolve_post_id(str(request.url))
+    try:
+        return await storage.singleflight(
+            f"inspect:{code}",
+            lambda: _inspect_post(code),
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RateLimitError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.get("/media/{platform}/{post_id}/{filename:path}")
