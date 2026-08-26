@@ -135,9 +135,9 @@ async def resolve_post_id(
         )
 
     try:
-        response = await client.head(url)
-        if response.status_code == 405:
-            response = await client.get(url)
+        # Threads share aliases may return 200 to HEAD without exposing the
+        # canonical redirect. GET follows the same path browsers use.
+        response = await client.get(url)
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         status = 404 if exc.response.status_code == 404 else 503
