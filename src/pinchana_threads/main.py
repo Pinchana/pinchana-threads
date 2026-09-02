@@ -49,7 +49,11 @@ storage = MediaStorage(
     base_path=os.getenv("CACHE_PATH", "./cache"),
     max_size_gb=float(os.getenv("CACHE_MAX_SIZE_GB", "10.0")),
 )
-THREADS_CACHE_VERSION = 3
+THREADS_CACHE_VERSION = 4
+
+
+class MediaDownloadError(RuntimeError):
+    pass
 
 
 class _InspectionCache:
@@ -109,7 +113,7 @@ def _cached_media_ready(metadata: dict) -> bool:
 
     for url in urls:
         path = _media_url_to_path(url)
-        if not path or not path.exists():
+        if not path or not path.is_file() or path.stat().st_size == 0:
             return False
 
     return True
@@ -414,6 +418,11 @@ async def _response_from_parsed(
         if download_media
         else []
     )
+    expected_media = [item for item in (parsed.get("media") or []) if item.get("url")]
+    if download_media and len(media_items) != len(expected_media):
+        raise MediaDownloadError(
+            f"downloaded {len(media_items)} of {len(expected_media)} Threads media items"
+        )
     music = (
         await _download_music(
             code,
@@ -514,6 +523,11 @@ async def _process_scrape_request(code: str):
             if attempt < 3:
                 await asyncio.sleep(15)
 
+    if isinstance(last_error, MediaDownloadError):
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "media_download_failed", "message": str(last_error)},
+        )
     raise HTTPException(
         status_code=503 if isinstance(last_error, RateLimitError) else 500,
         detail=str(last_error),
