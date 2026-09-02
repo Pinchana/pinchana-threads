@@ -250,6 +250,24 @@ async def test_video_download_includes_mp4_and_cover(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_incomplete_media_download_is_not_accepted(monkeypatch):
+    async def incomplete_download(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(main_module, "_download_media", incomplete_download)
+
+    with pytest.raises(main_module.MediaDownloadError):
+        await main_module._response_from_parsed(
+            SHORTCODE,
+            {
+                "code": SHORTCODE,
+                "media": [{"type": "image", "url": "https://cdn.example/image.jpg"}],
+            },
+            download_media=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_download_uses_detected_webp_extension(monkeypatch, tmp_path):
     async def fake_download(url, destination):
         destination.parent.mkdir(parents=True, exist_ok=True)
