@@ -217,7 +217,7 @@ async def test_video_download_includes_mp4_and_cover(monkeypatch, tmp_path):
         destination.write_bytes(b"media")
         return True
 
-    monkeypatch.setattr(main_module.storage, "base_path", tmp_path)
+    monkeypatch.setattr(main_module.storage, "_base_path", tmp_path)
     monkeypatch.setattr(main_module.storage, "download", fake_download)
 
     items = await main_module._download_media(
@@ -274,7 +274,7 @@ async def test_download_uses_detected_webp_extension(monkeypatch, tmp_path):
         destination.write_bytes(b"RIFF\x04\x00\x00\x00WEBP")
         return True
 
-    monkeypatch.setattr(main_module.storage, "base_path", tmp_path)
+    monkeypatch.setattr(main_module.storage, "_base_path", tmp_path)
     monkeypatch.setattr(main_module.storage, "download", fake_download)
 
     items = await main_module._download_media(
@@ -300,7 +300,7 @@ async def test_music_download_extracts_30_second_preview_and_cover(monkeypatch, 
         destination.write_bytes(b"preview")
         return True
 
-    monkeypatch.setattr(main_module.storage, "base_path", tmp_path)
+    monkeypatch.setattr(main_module.storage, "_base_path", tmp_path)
     monkeypatch.setattr(main_module.storage, "download", fake_download)
     monkeypatch.setattr(main_module, "_run_ffmpeg_preview", fake_ffmpeg)
 
@@ -331,7 +331,7 @@ async def test_music_preview_is_clamped_to_track_end(monkeypatch, tmp_path):
         destination.write_bytes(b"preview")
         return True
 
-    monkeypatch.setattr(main_module.storage, "base_path", tmp_path)
+    monkeypatch.setattr(main_module.storage, "_base_path", tmp_path)
     monkeypatch.setattr(main_module.storage, "download", fake_download)
     monkeypatch.setattr(main_module, "_run_ffmpeg_preview", fake_ffmpeg)
     music = ThreadsCloakScraper._parse_music({**POST, **MUSIC})
