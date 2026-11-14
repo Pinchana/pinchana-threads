@@ -6,7 +6,8 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "pinchana-core",
-    "cloakbrowser>=0.7.1",
+    # 0.6.5 is the last wrapper with upstream support for keyless Chromium.
+    "cloakbrowser==0.6.5",
     "curl-cffi>=0.17.0",
     "fastapi>=0.162.2",
     "httpx>=0.28.1",

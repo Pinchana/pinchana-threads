@@ -2,6 +2,10 @@
 
 This FastAPI module extracts public Threads posts from both `threads.net` and `threads.com`. It uses an HTTP-first strategy and a pooled browser fallback when the server-rendered response is gated or incomplete.
 
+The fallback uses CloakBrowser 0.6.5 and the free, keyless Chromium 146 build.
+Leave `CLOAKBROWSER_LICENSE_KEY` unset. On first use, the wrapper downloads and
+verifies the binary directly from CloakBrowser's distribution channels.
+
 ## Processing flow
 
 1. Normalize the post URL and resolve its shortcode.
